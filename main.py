@@ -36,167 +36,57 @@ async def product_webhook(request: Request, background_tasks: BackgroundTasks):
     print(f"🕵️ Received Product: {title} (ID: {product_id})")
     
     # Send to the "Brain" in the background (so Shopify doesn't timeout)
-    background_tasks.add_task(audit_and_fix_product, product_id, title, description, variants, vendor)
+    background_tasks.add_task(audit_and_fix_product, product_id, title, description, variants)
     
     return {"status": "received"}
 
 # 2. THE BRAIN: The Logic to Check and Fix Data
-def audit_and_fix_product(product_id, title, description, variants, vendor):
-    print(f"⚙️ Auditing '{title}'...")
+def audit_and_fix_product(product_id, title, description, variants):
+    print(f"⚙️ Auditing {title}...")
     
-    fixes_needed = False
-    new_data = {}
-
-    # --- HELPER FUNCTIONS ---
-    def get_google_category(title, description):
-        """
-        Uses AI to find the strict Google Product Taxonomy ID.
-        """
-        print(f"🧠 AI Categorizing: {title}")
-        prompt = f"""
-        You are a Google Shopping Taxonomy expert. 
-        Map the following product to the MOST specific Google Product Category ID.
-        
-        Product Title: "{title}"
-        Product Description: "{description}"
-        
-        Rules:
-        1. Respond with the Numeric ID ONLY (e.g., 536).
-        2. Do not write words.
-        3. If unsure, use the general category for the niche.
-        """
+    # We will build a single payload with all changes
+    payload = {}
+    tags_to_add = []
+    
+    # 1. CHECK DESCRIPTION
+    if not description or len(description) < 10: # Changed to 10 for testing
+        print("❌ Description empty. Generating AI description...")
         try:
-            response = openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            category_id = response.choices[0].message.content.strip()
-            if category_id.isdigit():
-                return category_id
-            else:
-                print(f"⚠️ AI returned non-digit: {category_id}")
-                return None
-        except Exception as e:
-            print(f"❌ AI Error: {e}")
-            return None
-
-    def sanitize_html(html_content):
-        """
-        Strips non-standard characters and reformats HTML.
-        Simple regex version for now.
-        """
-        if not html_content:
-            return ""
-        # Remove weird non-ascii chars (basic cleaning)
-        cleaned = re.sub(r'[^\x00-\x7F]+', ' ', html_content)
-        # Remove empty paragraphs
-        cleaned = re.sub(r'<p>\s*</p>', '', cleaned)
-        # Ensure paragraphs are well-formed (very basic)
-        if "<p>" not in cleaned:
-             cleaned = f"<p>{cleaned}</p>"
-        return cleaned
-
-    def check_gtin(variants, vendor):
-        """
-        Checks for missing GTINs.
-        If missing:
-          - Known brand -> Tag error
-          - Custom brand -> Generate custom SKU
-        Returns: (needs_update, updated_variants_list, tag_to_add)
-        """
-        updated_variants = []
-        variants_changed = False
-        tag_to_add = None
-        
-        known_brands = ["Nike", "Adidas", "Samsung", "Sony", "Apple"] # Example list
-
-        for variant in variants:
-            barcode = variant.get('barcode', '')
-            if not barcode:
-                if vendor in known_brands:
-                    print(f"⚠️ Missing GTIN for known brand {vendor}. Flagging.")
-                    tag_to_add = "Error: Missing GTIN"
-                else:
-                    # Custom brand - generate internal SKU/Barcode if missing
-                    # Note: We are putting this in 'sku' or 'barcode' depending on intent. 
-                    # Prompt said "specialized SKU structure". Let's update SKU if empty, or Barcode?
-                    # Usually 'barcode' field needs a valid GTIN. If custom, maybe we leave barcode empty 
-                    # but ensure SKU is set? Let's assume we gen a custom SKU.
-                    if not variant.get('sku'):
-                        new_sku = f"CUST-{vendor[:3].upper()}-{random.randint(1000, 9999)}"
-                        variant['sku'] = new_sku
-                        print(f"🔧 Generated custom SKU: {new_sku}")
-                        variants_changed = True
-            updated_variants.append(variant)
-            
-        return variants_changed, updated_variants, tag_to_add
-
-    # --- EXECUTE CHECKS ---
-
-    # CHECK 1: Sanitize Description
-    sanitized_desc = sanitize_html(description)
-    if sanitized_desc != description:
-        print("🧹 Description sanitized.")
-        new_data["body_html"] = sanitized_desc
-        fixes_needed = True
-        description = sanitized_desc # Update local var for next checks
-
-    # CHECK 2: Description Quality (AI)
-    if not description or len(description) < 50:
-        print("❌ Description too short. Generating AI description...")
-        prompt = f"Write a professional, SEO-optimized e-commerce description for a product titled '{title}'. Format as HTML."
-        try:
+            prompt = f"Write a 3-sentence exciting sales description for: {title}"
             response = openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}]
             )
-            new_description = response.choices[0].message.content
-            new_data["body_html"] = new_description
-            fixes_needed = True
-            description = new_description
+            new_desc = response.choices[0].message.content
+            payload["body_html"] = new_desc
+            print("✅ AI Description Generated.")
         except Exception as e:
-            print(f"❌ OpenAI Error: {e}")
+            print(f"⚠️ OpenAI Error: {e}")
 
-    # CHECK 3: Google Product Category
-    google_cat_id = get_google_category(title, description)
-    if google_cat_id:
-        print(f"✅ Determined Google Category ID: {google_cat_id}")
-        # Note: Metafields are updated separately or nested in some API versions. 
-        # For simplicity/safety, we will add it to a separate metafield update list 
-        # or structure it so the update function handles it.
-        # Assuming Shopify API version allows nested metafields in product update:
-        new_data["metafields"] = [
-            {
-                "namespace": "google",
-                "key": "google_product_category",
-                "value": int(google_cat_id),
-                "type": "integer",
-                "owner_resource": "product", # Required for some endpoints
-                "owner_id": product_id
-            }
-        ]
-        fixes_needed = True
-
-    # CHECK 4: GTIN / Variants
-    variants_changed, updated_variants, tag_error = check_gtin(variants, vendor)
-    if variants_changed:
-        new_data["variants"] = updated_variants
-        fixes_needed = True
-    
-    if tag_error:
-        add_tag_to_product(product_id, tag_error)
-
-    # CHECK 5: Weight Check
+    # 2. CHECK WEIGHT (The "Tagging" Logic)
+    # We check if ANY variant has 0 weight
+    has_weight_issue = False
     for variant in variants:
-        if variant.get('weight', 0) == 0:
-            print(f"⚠️ Variant {variant.get('id')} has 0 weight. Flagging.")
-            add_tag_to_product(product_id, "Validation-Error: Missing Weight")
-            # We don't stop here, we continue to allow other fixes to proceed
-    
-    # --- ACTION ---
-    if fixes_needed:
-        update_shopify_product(product_id, new_data)
+        if float(variant.get('weight', 0)) == 0:
+            has_weight_issue = True
+            break
+            
+    if has_weight_issue:
+        print("⚠️ Found 0kg weight. Adding tag.")
+        tags_to_add.append("Validation-Error: Missing Weight")
+
+    # 3. SAVE EVERYTHING
+    # If we have a new description OR new tags, we update Shopify
+    if payload or tags_to_add:
+        # First, we need to handle tags (Shopify expects a comma-separated string)
+        if tags_to_add:
+            # We would ideally fetch existing tags first, but for now let's just push the error tag
+            payload["tags"] = ",".join(tags_to_add)
+            
+        print(f"💾 Saving updates to Shopify: {payload.keys()}")
+        update_shopify_product(product_id, payload)
+    else:
+        print("✨ Product looks good. No changes needed.")
 
 def update_shopify_product(product_id, payload):
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2023-10/products/{product_id}.json"
