@@ -34,18 +34,18 @@ async def product_webhook(request: Request, background_tasks: BackgroundTasks):
     
     return {"status": "received"}
 
-# 2. THE BRAIN (Consolidated Logic)
+# 2. THE BRAIN (With Debugging)
 def audit_and_fix_product(product_id, title, description, variants):
     print(f"⚙️ Auditing {title}...")
     
     payload = {}
+    error_tag = None
     
     # --- CHECK 1: DESCRIPTION ---
-    # We check if it is None (empty) OR shorter than 10 characters
     if not description or len(description) < 10:
-        print("❌ Description empty/short. Generating AI description...")
+        print("❌ Description empty. Generating AI description...")
         try:
-            prompt = f"Write a 3-sentence exciting sales description for a product named: {title}. Format it with HTML paragraph tags <p>."
+            prompt = f"Write a 3-sentence exciting sales description for: {title}. Use HTML <p> tags."
             
             response = openai.chat.completions.create(
                 model="gpt-4o-mini",
@@ -54,11 +54,20 @@ def audit_and_fix_product(product_id, title, description, variants):
             new_desc = response.choices[0].message.content
             payload["body_html"] = new_desc
             print("✅ AI Description Generated.")
+            
         except Exception as e:
-            print(f"⚠️ OpenAI Error: {e}")
-            # Check if it's a quota issue
-            if "insufficient_quota" in str(e):
-                print("‼️ CRITICAL: OpenAI credits expired. Check billing at platform.openai.com")
+            # THIS IS THE NEW PART: Catch the error and prepare it as a tag
+            error_message = str(e)
+            print(f"⚠️ OpenAI Error: {error_message}")
+            
+            if "insufficient_quota" in error_message:
+                error_tag = "ERR: No-Credits"
+            elif "invalid_api_key" in error_message:
+                error_tag = "ERR: Bad-Key"
+            else:
+                # Take first 15 chars of error
+                clean_err = ''.join(e for e in error_message if e.isalnum())[:15]
+                error_tag = f"ERR: {clean_err}"
 
     # --- CHECK 2: WEIGHT TAGS ---
     has_weight_issue = False
@@ -67,48 +76,36 @@ def audit_and_fix_product(product_id, title, description, variants):
             has_weight_issue = True
             break
             
+    # --- SAVE TAGS ---
+    # We combine weight error AND debug error
     if has_weight_issue:
-        print("⚠️ Found 0kg weight. Queueing tag.")
-        # We handle tags carefully to not delete old ones
         add_tag_to_product(product_id, "Validation-Error: Missing Weight")
+        
+    if error_tag:
+        add_tag_to_product(product_id, error_tag)
 
-    # --- SAVE UPDATES ---
+    # --- SAVE DESCRIPTION ---
     if payload:
-        print(f"💾 Saving description update...")
         update_shopify_product(product_id, payload)
-    else:
-        print("✨ Description looked good. No update needed.")
 
 # --- HELPER FUNCTIONS ---
 
 def update_shopify_product(product_id, payload):
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2023-10/products/{product_id}.json"
-    headers = {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,
-        "Content-Type": "application/json"
-    }
-    response = requests.put(url, json={"product": payload}, headers=headers)
-    if response.status_code == 200:
-        print(f"✅ Product {product_id} updated!")
-    else:
-        print(f"❌ Update Failed: {response.text}")
+    headers = {"X-Shopify-Access-Token": ACCESS_TOKEN, "Content-Type": "application/json"}
+    requests.put(url, json={"product": payload}, headers=headers)
 
 def add_tag_to_product(product_id, tag):
-    # Safer tagging: Fetch existing tags first, then append
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2023-10/products/{product_id}.json"
     headers = {"X-Shopify-Access-Token": ACCESS_TOKEN}
-    
     try:
         r = requests.get(url, headers=headers)
         current_tags = r.json()['product']['tags']
-        
         if tag not in current_tags:
             new_tags = f"{current_tags}, {tag}" if current_tags else tag
-            # Update just the tags
             requests.put(url, json={"product": {"id": product_id, "tags": new_tags}}, headers=headers)
-            print(f"✅ Tag '{tag}' added.")
-    except Exception as e:
-        print(f"❌ Tagging Error: {e}")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10000)
