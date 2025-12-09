@@ -157,6 +157,31 @@ def add_tag_to_product(shop, token, product_id, tag):
             requests.put(url, json={"product": {"id": product_id, "tags": new_tags}}, headers=headers)
     except Exception:
         pass
+# Add this at the very bottom of main.py, above the "if __name__" line:
 
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+        <head>
+            <title>Ghost Validator</title>
+            <style>
+                body { font-family: sans-serif; text-align: center; padding: 50px; background-color: #f4f6f8; }
+                .card { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); display: inline-block; }
+                h1 { color: #008060; }
+                p { color: #6d7175; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h1>✅ System Active</h1>
+                <p>Ghost Validator is running in the background.</p>
+                <p>You can close this window and manage your products as usual.</p>
+            </div>
+        </body>
+    </html>
+    """
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10000)
